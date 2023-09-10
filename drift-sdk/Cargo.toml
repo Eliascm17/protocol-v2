@@ -1,0 +1,9 @@
+[package]
+name = "drift-sdk"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+drift = { path = "../programs/drift", version = "2.38.0" }
+anchor-lang = { git = "https://github.com/drift-labs/anchor.git", rev = "ed950fe", version = "0.26.0" }
+
