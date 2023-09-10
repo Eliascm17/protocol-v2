@@ -1,6 +1,7 @@
 [workspace]
 members = [
 	"programs/*",
+	"drift-sdk"
 ]
 exclude = [
 	"deps/serum-dex"
