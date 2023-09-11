@@ -1,13 +1,27 @@
 use std::collections::{HashMap, HashSet};
 
 use anchor_lang::prelude::Pubkey;
-use drift::state::{
-    events::OrderRecord,
-    user::{Order, OrderStatus, OrderType, User},
-    user_map::UserMap,
+use drift::{
+    controller::position::PositionDirection,
+    error::DriftResult,
+    state::{
+        events::OrderRecord,
+        user::{Order, OrderStatus, OrderTriggerCondition, OrderType},
+        user_map::UserMap,
+    },
 };
 
-use crate::{dlob_orders::DLOBOrders, node_list::NodeList};
+use crate::{
+    dlob_node::DLOBNodeType,
+    dlob_orders::DLOBOrders,
+    node_list::{NodeList, SortDirection},
+};
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Side {
+    Bid,
+    Ask,
+}
 
 // custom enum because the original doesn't impl Hash
 #[derive(Clone, Copy, Hash, Eq, PartialEq)]
@@ -25,14 +39,15 @@ impl From<drift::state::user::MarketType> for MarketType {
     }
 }
 
-pub struct MarketNodeLists {
-    pub resting_limit: SideNodeList,
-    pub floating_limit: SideNodeList,
-    pub taking_limit: SideNodeList,
-    pub market: SideNodeList,
-    pub trigger: TriggerNodeList,
+pub enum MarketNodeLists {
+    RestingLimit(SideNodeList),
+    FloatingLimit(SideNodeList),
+    TakingLimit(SideNodeList),
+    Market(SideNodeList),
+    Trigger(TriggerNodeList),
 }
 
+#[derive(Debug, Clone)]
 pub struct SideNodeList {
     pub ask: NodeList,
     pub bid: NodeList,
@@ -45,7 +60,7 @@ pub struct TriggerNodeList {
 
 pub struct DLOB {
     open_orders: HashMap<MarketType, HashSet<String>>,
-    order_list: HashMap<MarketType, HashMap<i32, MarketNodeLists>>,
+    order_lists: HashMap<MarketType, HashMap<u16, MarketNodeLists>>,
     max_slot_for_resting_limit_orders: u32,
     initialized: bool,
 }
@@ -56,13 +71,13 @@ impl Default for DLOB {
         open_orders.insert(MarketType::Perp, HashSet::new());
         open_orders.insert(MarketType::Spot, HashSet::new());
 
-        let mut order_list = HashMap::new();
-        order_list.insert(MarketType::Perp, HashMap::new());
-        order_list.insert(MarketType::Spot, HashMap::new());
+        let mut order_lists = HashMap::new();
+        order_lists.insert(MarketType::Perp, HashMap::new());
+        order_lists.insert(MarketType::Spot, HashMap::new());
 
         Self {
             open_orders,
-            order_list,
+            order_lists,
             max_slot_for_resting_limit_orders: 0,
             initialized: false,
         }
@@ -70,86 +85,99 @@ impl Default for DLOB {
 }
 
 impl DLOB {
-    pub fn new() -> Self {
-        DLOB::default()
+    pub fn new() -> DriftResult<Self> {
+        Ok(DLOB::default())
     }
 
-    pub fn initialize(&mut self) {
+    pub fn initialize(&mut self) -> DriftResult<()> {
         self.initialized = true;
+        Ok(())
     }
 
-    pub fn clear(&mut self) {
+    pub fn clear(&mut self) -> DriftResult<()> {
         for market_type in self.open_orders.keys().cloned().collect::<Vec<_>>() {
             self.open_orders.get_mut(&market_type).unwrap().clear();
         }
         self.open_orders.clear();
 
-        for market_type in self.order_list.keys().cloned().collect::<Vec<_>>() {
-            if let Some(market_node_lists_map) = self.order_list.get_mut(&market_type) {
+        for market_type in self.order_lists.keys().cloned().collect::<Vec<_>>() {
+            if let Some(market_node_lists_map) = self.order_lists.get_mut(&market_type) {
                 for market_node_lists in market_node_lists_map.values_mut() {
-                    market_node_lists.resting_limit.ask.clear();
-                    market_node_lists.resting_limit.bid.clear();
-                    market_node_lists.floating_limit.ask.clear();
-                    market_node_lists.floating_limit.bid.clear();
-                    market_node_lists.taking_limit.ask.clear();
-                    market_node_lists.taking_limit.bid.clear();
-                    market_node_lists.market.ask.clear();
-                    market_node_lists.market.bid.clear();
-                    market_node_lists.trigger.above.clear();
-                    market_node_lists.trigger.below.clear();
+                    match market_node_lists {
+                        MarketNodeLists::RestingLimit(side_node_list)
+                        | MarketNodeLists::FloatingLimit(side_node_list)
+                        | MarketNodeLists::TakingLimit(side_node_list)
+                        | MarketNodeLists::Market(side_node_list) => {
+                            side_node_list.ask.clear();
+                            side_node_list.bid.clear();
+                        }
+                        MarketNodeLists::Trigger(trigger_node_list) => {
+                            trigger_node_list.above.clear();
+                            trigger_node_list.below.clear();
+                        }
+                    }
                 }
             }
         }
-        self.order_list.clear();
+        self.order_lists.clear();
 
         self.max_slot_for_resting_limit_orders = 0;
 
         self.initialize();
+
+        Ok(())
     }
 
     //TODO
-    fn init_from_user_map(&mut self, user_map: UserMap, slot: u64) -> bool {
+    fn init_from_user_map(&mut self, user_map: UserMap, slot: u64) -> DriftResult<bool> {
         if self.initialized {
-            return false;
+            return Ok(false);
         }
 
-        true
+        Ok(true)
     }
 
-    pub fn init_from_orders(&mut self, dlob_orders: DLOBOrders, slot: u64) -> bool {
+    pub fn init_from_orders(&mut self, dlob_orders: DLOBOrders, slot: u64) -> DriftResult<bool> {
         if self.initialized {
-            return false;
+            return Ok(false);
         }
 
         for dlob_order in dlob_orders {
-            self.insert_order(dlob_order.order.clone(), dlob_order.user.clone(), slot);
+            self.insert_order(dlob_order.order, dlob_order.user, slot);
         }
 
-        self.initialized = true;
-        true
+        self.initialize();
+        Ok(true)
     }
 
-    pub fn handle_order_record(&mut self, record: OrderRecord, slot: u64) {
-        self.insert_order(record.order, record.user, slot);
+    pub fn handle_order_record(&mut self, record: OrderRecord, slot: u64) -> DriftResult<()> {
+        self.insert_order(record.order, record.user, slot)
     }
 
-    pub fn insert_order(&mut self, order: Order, user_account: Pubkey, slot: u64) {
+    pub fn insert_order(
+        &mut self,
+        order: Order,
+        user_account: Pubkey,
+        slot: u64,
+    ) -> DriftResult<()> {
         if matches!(order.status, OrderStatus::Init) {
-            return;
+            return Ok(());
         }
 
-        match order.order_type {
-            OrderType::Market => {}
-            OrderType::Limit => {}
-            OrderType::TriggerMarket => {}
-            OrderType::TriggerLimit => {}
-            OrderType::Oracle => {}
-            _ => return,
+        if !matches!(
+            order.order_type,
+            OrderType::Market
+                | OrderType::Limit
+                | OrderType::TriggerMarket
+                | OrderType::TriggerLimit
+                | OrderType::Oracle
+        ) {
+            return Ok(());
         }
 
         let market_type = order.market_type;
 
-        if !self.order_list.contains_key(&market_type.into()) {
+        if !self.order_lists.contains_key(&market_type.into()) {
             self.add_order_list(market_type.into(), order.market_index);
         }
 
@@ -161,16 +189,243 @@ impl DLOB {
                 .insert(order_signature);
         }
 
-        if let Some(mut list) = self.get_list_for_order(&order, slot) {
-            list.insert(order, market_type, user_account);
+        if let Some(mut list) = self.get_list_for_order(order, slot) {
+            list.insert(order, user_account)?;
+        }
+
+        Ok(())
+    }
+
+    fn add_order_list(&mut self, market_type: MarketType, market_index: u16) {
+        let resting_limit = MarketNodeLists::RestingLimit(SideNodeList {
+            ask: NodeList::new(DLOBNodeType::RestingLimit, SortDirection::Asc),
+            bid: NodeList::new(DLOBNodeType::RestingLimit, SortDirection::Desc),
+        });
+        let floating_limit = MarketNodeLists::FloatingLimit(SideNodeList {
+            ask: NodeList::new(DLOBNodeType::FloatingLimit, SortDirection::Asc),
+            bid: NodeList::new(DLOBNodeType::FloatingLimit, SortDirection::Desc),
+        });
+        let taking_limit = MarketNodeLists::TakingLimit(SideNodeList {
+            ask: NodeList::new(DLOBNodeType::TakingLimit, SortDirection::Asc),
+            bid: NodeList::new(DLOBNodeType::TakingLimit, SortDirection::Asc),
+        });
+        let market = MarketNodeLists::Market(SideNodeList {
+            ask: NodeList::new(DLOBNodeType::Market, SortDirection::Asc),
+            bid: NodeList::new(DLOBNodeType::Market, SortDirection::Asc),
+        });
+        let trigger = MarketNodeLists::Trigger(TriggerNodeList {
+            above: NodeList::new(DLOBNodeType::Trigger, SortDirection::Asc),
+            below: NodeList::new(DLOBNodeType::Trigger, SortDirection::Desc),
+        });
+
+        let market_node_lists = vec![resting_limit, floating_limit, taking_limit, market, trigger];
+
+        if let Some(market_node_lists_map) = self.order_lists.get_mut(&market_type) {
+            for market_node_list in market_node_lists {
+                market_node_lists_map.insert(market_index, market_node_list);
+            }
+        } else {
+            let mut new_market_node_lists_map = HashMap::new();
+            for market_node_list in market_node_lists {
+                new_market_node_lists_map.insert(market_index, market_node_list);
+            }
+            self.order_lists
+                .insert(market_type, new_market_node_lists_map);
         }
     }
 
-    //TODO
-    fn add_order_list(&mut self, market_type: MarketType, market_index: u16) {}
+    fn get_list_for_order(&self, order: Order, slot: u64) -> Option<NodeList> {
+        let node_type = determine_node_type(&order, slot);
+        let is_inactive_trigger_order = node_type == DLOBNodeType::Trigger;
+        let order_sub_type = determine_sub_type(&order, is_inactive_trigger_order);
 
-    //TODO
-    fn get_list_for_order(&self, order: &Order, slot: u64) -> Option<NodeList> {
-        None
+        self.order_lists
+            .get(&order.market_type.into())
+            .and_then(|d| d.get(&order.market_index))
+            .and_then(|market_node_lists| match market_node_lists {
+                MarketNodeLists::RestingLimit(list)
+                | MarketNodeLists::FloatingLimit(list)
+                | MarketNodeLists::TakingLimit(list)
+                | MarketNodeLists::Market(list) => {
+                    if let OrderSubType::Side(side) = order_sub_type {
+                        match side {
+                            Side::Ask => Some(&list.ask),
+                            Side::Bid => Some(&list.bid),
+                        }
+                    } else {
+                        None
+                    }
+                }
+                MarketNodeLists::Trigger(list) => {
+                    if let OrderSubType::Trigger(trigger) = order_sub_type {
+                        match trigger {
+                            OrderTriggerCondition::Above => Some(&list.above),
+                            OrderTriggerCondition::Below => Some(&list.below),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                }
+            })
+            .cloned()
+    }
+
+    fn delete(&mut self, order: Order, user_account: Pubkey, slot: u64) -> DriftResult<()> {
+        if order.status == OrderStatus::Init {
+            return Ok(());
+        }
+
+        self.update_resting_limit_orders(slot)?;
+
+        if let Some(mut list) = self.get_list_for_order(order, slot) {
+            list.remove(order, user_account)?
+        }
+
+        Ok(())
+    }
+
+    fn update_order(
+        &mut self,
+        order: Order,
+        user_account: Pubkey,
+        slot: u64,
+        cumulative_base_asset_amount_filled: u64,
+    ) -> DriftResult<()> {
+        self.update_resting_limit_orders(slot)?;
+
+        if order
+            .base_asset_amount
+            .eq(&cumulative_base_asset_amount_filled)
+        {
+            self.delete(order, user_account, slot)?;
+            return Ok(());
+        }
+
+        if order
+            .base_asset_amount_filled
+            .eq(&cumulative_base_asset_amount_filled)
+        {
+            return Ok(());
+        }
+
+        let mut new_order = order;
+
+        new_order.base_asset_amount = cumulative_base_asset_amount_filled;
+
+        if let Some(mut node_list) = self.get_list_for_order(order, slot) {
+            node_list.update(new_order, user_account)?;
+        }
+
+        Ok(())
+    }
+
+    fn update_resting_limit_orders(&mut self, slot: u64) -> DriftResult<()> {
+        if slot <= self.max_slot_for_resting_limit_orders as u64 {
+            return Ok(());
+        }
+
+        self.max_slot_for_resting_limit_orders = 0;
+
+        self.update_resting_limit_orders_for_market_type(slot, MarketType::Perp)?;
+        self.update_resting_limit_orders_for_market_type(slot, MarketType::Spot)?;
+
+        Ok(())
+    }
+
+    fn update_resting_limit_orders_for_market_type(
+        &mut self,
+        slot: u64,
+        market_type: MarketType,
+    ) -> DriftResult<()> {
+        if let Some(map) = self.order_lists.get_mut(&market_type) {
+            for market_node_lists in map.values_mut() {
+                let mut nodes_to_update = Vec::new();
+
+                if let MarketNodeLists::TakingLimit(taking_limit) = market_node_lists {
+                    for node in taking_limit.ask.iter() {
+                        if let Some(order) = node.order() {
+                            if !order.is_resting_limit_order(slot).unwrap() {
+                                continue;
+                            }
+                        }
+                        nodes_to_update.push((Side::Ask, node));
+                    }
+
+                    for node in taking_limit.bid.iter() {
+                        if let Some(order) = node.order() {
+                            if !order.is_resting_limit_order(slot).unwrap() {
+                                continue;
+                            }
+                        }
+                        nodes_to_update.push((Side::Bid, node));
+                    }
+                }
+
+                for (side, node) in nodes_to_update {
+                    if let MarketNodeLists::RestingLimit(resting_limit) = market_node_lists {
+                        match side {
+                            Side::Ask => {
+                                if let Some(order) = node.order() {
+                                    if let Some(user_account) = node.user_account() {
+                                        resting_limit.ask.remove(*order, *user_account)?;
+                                        resting_limit.ask.insert(*order, *user_account)?;
+                                    }
+                                }
+                            }
+                            Side::Bid => {
+                                if let Some(order) = node.order() {
+                                    if let Some(user_account) = node.user_account() {
+                                        resting_limit.bid.remove(*order, *user_account)?;
+                                        resting_limit.bid.insert(*order, *user_account)?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub enum OrderSubType {
+    Trigger(OrderTriggerCondition),
+    Side(Side),
+}
+
+fn determine_sub_type(order: &Order, is_inactive_trigger_order: bool) -> OrderSubType {
+    if is_inactive_trigger_order {
+        OrderSubType::Trigger(match order.trigger_condition {
+            OrderTriggerCondition::Above => OrderTriggerCondition::Above,
+            _ => OrderTriggerCondition::Below,
+        })
+    } else {
+        OrderSubType::Side(match order.direction {
+            PositionDirection::Long => Side::Bid,
+            _ => Side::Ask,
+        })
+    }
+}
+
+fn determine_node_type(order: &Order, slot: u64) -> DLOBNodeType {
+    if matches!(
+        order.trigger_condition,
+        OrderTriggerCondition::TriggeredAbove | OrderTriggerCondition::TriggeredBelow
+    ) && order.must_be_triggered()
+    {
+        DLOBNodeType::Trigger
+    } else if matches!(
+        order.order_type,
+        OrderType::Market | OrderType::TriggerMarket | OrderType::Oracle
+    ) {
+        DLOBNodeType::Market
+    } else if order.oracle_price_offset != 0 {
+        DLOBNodeType::FloatingLimit
+    } else if order.is_resting_limit_order(slot).unwrap() {
+        DLOBNodeType::RestingLimit
+    } else {
+        DLOBNodeType::TakingLimit
     }
 }

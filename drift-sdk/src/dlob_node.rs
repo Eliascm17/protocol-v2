@@ -82,7 +82,7 @@ impl OrderNode {
 }
 
 #[derive(Debug, Clone)]
-pub enum DLOBNodeType {
+pub enum DLOBNodeOrders {
     RestingLimit(OrderNode),
     TakingLimit(OrderNode),
     FloatingLimit(OrderNode),
@@ -90,7 +90,7 @@ pub enum DLOBNodeType {
     Trigger(OrderNode),
 }
 
-impl DLOBNode for DLOBNodeType {
+impl DLOBNode for DLOBNodeOrders {
     fn get_price(&self, oracle_price_data: &OraclePriceData, slot: u64) -> i128 {
         oracle_price_data.price as i128
     }
@@ -101,11 +101,11 @@ impl DLOBNode for DLOBNodeType {
 
     fn is_base_filled(&self) -> bool {
         match self {
-            DLOBNodeType::RestingLimit(order_node)
-            | DLOBNodeType::TakingLimit(order_node)
-            | DLOBNodeType::FloatingLimit(order_node)
-            | DLOBNodeType::Market(order_node)
-            | DLOBNodeType::Trigger(order_node) => order_node
+            DLOBNodeOrders::RestingLimit(order_node)
+            | DLOBNodeOrders::TakingLimit(order_node)
+            | DLOBNodeOrders::FloatingLimit(order_node)
+            | DLOBNodeOrders::Market(order_node)
+            | DLOBNodeOrders::Trigger(order_node) => order_node
                 .order
                 .base_asset_amount_filled
                 .eq(&order_node.order.base_asset_amount),
@@ -114,41 +114,41 @@ impl DLOBNode for DLOBNodeType {
 
     fn have_filled(&self) -> bool {
         match self {
-            DLOBNodeType::RestingLimit(order_node)
-            | DLOBNodeType::TakingLimit(order_node)
-            | DLOBNodeType::FloatingLimit(order_node)
-            | DLOBNodeType::Market(order_node)
-            | DLOBNodeType::Trigger(order_node) => order_node.have_filled,
+            DLOBNodeOrders::RestingLimit(order_node)
+            | DLOBNodeOrders::TakingLimit(order_node)
+            | DLOBNodeOrders::FloatingLimit(order_node)
+            | DLOBNodeOrders::Market(order_node)
+            | DLOBNodeOrders::Trigger(order_node) => order_node.have_filled,
         }
     }
 
     fn order(&self) -> Option<&Order> {
         match self {
-            DLOBNodeType::RestingLimit(order_node)
-            | DLOBNodeType::TakingLimit(order_node)
-            | DLOBNodeType::FloatingLimit(order_node)
-            | DLOBNodeType::Market(order_node)
-            | DLOBNodeType::Trigger(order_node) => Some(&order_node.order),
+            DLOBNodeOrders::RestingLimit(order_node)
+            | DLOBNodeOrders::TakingLimit(order_node)
+            | DLOBNodeOrders::FloatingLimit(order_node)
+            | DLOBNodeOrders::Market(order_node)
+            | DLOBNodeOrders::Trigger(order_node) => Some(&order_node.order),
         }
     }
 
     fn user_account(&self) -> Option<&Pubkey> {
         match self {
-            DLOBNodeType::RestingLimit(order_node)
-            | DLOBNodeType::TakingLimit(order_node)
-            | DLOBNodeType::FloatingLimit(order_node)
-            | DLOBNodeType::Market(order_node)
-            | DLOBNodeType::Trigger(order_node) => Some(&order_node.user_account),
+            DLOBNodeOrders::RestingLimit(order_node)
+            | DLOBNodeOrders::TakingLimit(order_node)
+            | DLOBNodeOrders::FloatingLimit(order_node)
+            | DLOBNodeOrders::Market(order_node)
+            | DLOBNodeOrders::Trigger(order_node) => Some(&order_node.user_account),
         }
     }
 
     fn sort_value(&self) -> i128 {
         match self {
-            DLOBNodeType::RestingLimit(order_node)
-            | DLOBNodeType::TakingLimit(order_node)
-            | DLOBNodeType::FloatingLimit(order_node)
-            | DLOBNodeType::Market(order_node)
-            | DLOBNodeType::Trigger(order_node) => order_node.sort_value,
+            DLOBNodeOrders::RestingLimit(order_node)
+            | DLOBNodeOrders::TakingLimit(order_node)
+            | DLOBNodeOrders::FloatingLimit(order_node)
+            | DLOBNodeOrders::Market(order_node)
+            | DLOBNodeOrders::Trigger(order_node) => order_node.sort_value,
         }
     }
 }
@@ -160,11 +160,32 @@ pub fn create_node(
 ) -> Arc<dyn DLOBNode> {
     let order_node = OrderNode::new(order, user_account);
     let node = match node_type {
-        DLOBNodeType::RestingLimit(..) => DLOBNodeType::RestingLimit(order_node),
-        DLOBNodeType::TakingLimit(..) => DLOBNodeType::TakingLimit(order_node),
-        DLOBNodeType::FloatingLimit(..) => DLOBNodeType::FloatingLimit(order_node),
-        DLOBNodeType::Market(..) => DLOBNodeType::Market(order_node),
-        DLOBNodeType::Trigger(..) => DLOBNodeType::Trigger(order_node),
+        DLOBNodeType::RestingLimit => DLOBNodeOrders::RestingLimit(order_node),
+        DLOBNodeType::TakingLimit => DLOBNodeOrders::TakingLimit(order_node),
+        DLOBNodeType::FloatingLimit => DLOBNodeOrders::FloatingLimit(order_node),
+        DLOBNodeType::Market => DLOBNodeOrders::Market(order_node),
+        DLOBNodeType::Trigger => DLOBNodeOrders::Trigger(order_node),
     };
     Arc::new(node)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DLOBNodeType {
+    RestingLimit,
+    TakingLimit,
+    FloatingLimit,
+    Market,
+    Trigger,
+}
+
+impl From<DLOBNodeOrders> for DLOBNodeType {
+    fn from(node_orders: DLOBNodeOrders) -> Self {
+        match node_orders {
+            DLOBNodeOrders::RestingLimit(_) => DLOBNodeType::RestingLimit,
+            DLOBNodeOrders::TakingLimit(_) => DLOBNodeType::TakingLimit,
+            DLOBNodeOrders::FloatingLimit(_) => DLOBNodeType::FloatingLimit,
+            DLOBNodeOrders::Market(_) => DLOBNodeType::Market,
+            DLOBNodeOrders::Trigger(_) => DLOBNodeType::Trigger,
+        }
+    }
 }
