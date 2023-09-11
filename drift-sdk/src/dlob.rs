@@ -14,7 +14,7 @@ use drift::{
 use crate::{
     dlob_node::DLOBNodeType,
     dlob_orders::DLOBOrders,
-    node_list::{NodeList, SortDirection},
+    node_list::{get_order_signature, NodeList, SortDirection},
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -123,7 +123,7 @@ impl DLOB {
 
         self.max_slot_for_resting_limit_orders = 0;
 
-        self.initialize();
+        self.initialize()?;
 
         Ok(())
     }
@@ -143,10 +143,10 @@ impl DLOB {
         }
 
         for dlob_order in dlob_orders {
-            self.insert_order(dlob_order.order, dlob_order.user, slot);
+            self.insert_order(dlob_order.order, dlob_order.user, slot)?;
         }
 
-        self.initialize();
+        self.initialize()?;
         Ok(true)
     }
 
@@ -285,6 +285,45 @@ impl DLOB {
         Ok(())
     }
 
+    fn trigger(&mut self, order: Order, user_account: Pubkey, slot: u64) -> DriftResult<()> {
+        if order.status == OrderStatus::Init {
+            return Ok(());
+        }
+
+        self.update_resting_limit_orders(slot)?;
+
+        if order.trigger_condition == OrderTriggerCondition::Above
+            || order.trigger_condition == OrderTriggerCondition::Below
+        {
+            return Ok(());
+        }
+
+        if let Some(market_node_lists) = self.order_lists.get_mut(&order.market_type.into()) {
+            if let Some(node_list) = market_node_lists.get_mut(&order.market_index) {
+                let trigger_list = match node_list {
+                    MarketNodeLists::Trigger(trigger_node_list) => {
+                        Some(if order.trigger_condition == OrderTriggerCondition::Above {
+                            &mut trigger_node_list.above
+                        } else {
+                            &mut trigger_node_list.below
+                        })
+                    }
+                    _ => None,
+                };
+
+                if let Some(trigger_list) = trigger_list {
+                    trigger_list.remove(order, user_account)?;
+                }
+
+                if let Some(mut node_list) = self.get_list_for_order(order, slot) {
+                    node_list.insert(order, user_account)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn update_order(
         &mut self,
         order: Order,
@@ -387,6 +426,53 @@ impl DLOB {
             }
         }
         Ok(())
+    }
+
+    fn get_order(&self, order_id: u32, user_account: Pubkey) -> DriftResult<Option<Order>> {
+        let order_sig = get_order_signature(order_id, &user_account);
+        for node_list in self.get_node_lists() {
+            if let Some(node) = node_list.get(&order_sig) {
+                if let Some(order) = node.order() {
+                    return Ok(Some(*order));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn get_node_lists(&self) -> Vec<NodeList> {
+        let perp_node_lists: Vec<_> = self
+            .order_lists
+            .get(&MarketType::Perp)
+            .unwrap_or(&HashMap::new())
+            .values()
+            .flat_map(|market_node_list| match market_node_list {
+                MarketNodeLists::RestingLimit(list) => vec![list.ask.clone(), list.bid.clone()],
+                MarketNodeLists::FloatingLimit(list) => vec![list.ask.clone(), list.bid.clone()],
+                MarketNodeLists::TakingLimit(list) => vec![list.ask.clone(), list.bid.clone()],
+                MarketNodeLists::Market(list) => vec![list.ask.clone(), list.bid.clone()],
+                MarketNodeLists::Trigger(list) => vec![list.above.clone(), list.below.clone()],
+            })
+            .collect();
+
+        let spot_node_lists: Vec<_> = self
+            .order_lists
+            .get(&MarketType::Spot)
+            .unwrap_or(&HashMap::new())
+            .values()
+            .flat_map(|market_node_list| match market_node_list {
+                MarketNodeLists::RestingLimit(list) => vec![list.ask.clone(), list.bid.clone()],
+                MarketNodeLists::FloatingLimit(list) => vec![list.ask.clone(), list.bid.clone()],
+                MarketNodeLists::TakingLimit(list) => vec![list.ask.clone(), list.bid.clone()],
+                MarketNodeLists::Market(list) => vec![list.ask.clone(), list.bid.clone()],
+                MarketNodeLists::Trigger(list) => vec![list.above.clone(), list.below.clone()],
+            })
+            .collect();
+
+        let mut all_node_lists = perp_node_lists;
+        all_node_lists.extend(spot_node_lists);
+
+        all_node_lists
     }
 }
 
